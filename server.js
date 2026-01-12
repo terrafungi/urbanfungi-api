@@ -1,6 +1,3 @@
-// urbanfungi-api/server.js
-require("dotenv").config();
-
 const express = require("express");
 const cors = require("cors");
 
@@ -8,16 +5,19 @@ const app = express();
 app.use(express.json());
 
 // ---- ENV
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const BOT_TOKEN = process.env.BOT_TOKEN; // utilisé seulement pour sendMessage côté API
 const ADMIN_CHAT_ID = Number(process.env.ADMIN_CHAT_ID || "0");
-const BTC_ADDRESS = process.env.BTC_ADDRESS || "bc1q7ttd985n9nlky9gqe9vxwqq33u007ssvq0dnql";
+const BTC_ADDRESS =
+  process.env.BTC_ADDRESS || "bc1q7ttd985n9nlky9gqe9vxwqq33u007ssvq0dnql";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// Sécurité admin pour endpoints (IMPORTANT)
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
 
 if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
   console.error("❌ BOT_TOKEN ou ADMIN_CHAT_ID manquant (Render > Environment)");
 }
 
-// ---- CORS
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
@@ -27,16 +27,13 @@ app.use(
 );
 
 // ---- In-memory store (⚠️ reset au restart Render)
-const orders = new Map(); // orderCode -> { user, items, totalEur, status, createdAt }
+const orders = new Map(); // orderCode -> { user, items, totalEur, status, createdAt, updatedAt }
 
-// ---- Utils
 function money(n) {
   return Number(n || 0).toFixed(2);
 }
 
 async function tgSend(chatId, text, extra = {}) {
-  if (!BOT_TOKEN) return { ok: false, error: "BOT_TOKEN missing" };
-
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 
   const payload = {
@@ -58,10 +55,6 @@ async function tgSend(chatId, text, extra = {}) {
   return data;
 }
 
-function buildItemsText(items) {
-  return items.map((i) => `- ${i.nom} x${i.qty} — ${money(i.prix)} €`).join("\n");
-}
-
 // ---- Health
 app.get("/", (req, res) => res.send("UrbanFungi API OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -70,30 +63,28 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.post("/api/create-order", async (req, res) => {
   try {
     const { user, items, totalEur } = req.body || {};
-
     if (!user?.id) return res.status(400).json({ ok: false, error: "Missing user.id" });
-    if (!Array.isArray(items) || items.length === 0)
+    if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "Empty items" });
+    }
 
     const orderCode = `CMD-${Math.floor(1000 + Math.random() * 9000)}`;
+    const now = new Date().toISOString();
 
     const order = {
       orderCode,
-      user: { id: Number(user.id), username: user.username || null },
-      items: items.map((x) => ({
-        id: x.id,
-        nom: x.nom,
-        prix: Number(x.prix),
-        qty: Number(x.qty),
-      })),
+      user: { id: user.id, username: user.username || null },
+      items,
       totalEur: Number(totalEur || 0),
       status: "EN_ATTENTE",
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
-
     orders.set(orderCode, order);
 
-    const itemsText = buildItemsText(order.items);
+    const itemsText = items
+      .map((i) => `- ${i.nom} x${i.qty} — ${money(i.prix)} €`)
+      .join("\n");
 
     const adminText =
       `🧾 <b>NOUVELLE COMMANDE ${orderCode}</b>\n` +
@@ -104,27 +95,27 @@ app.post("/api/create-order", async (req, res) => {
       `Adresse BTC: <code>${BTC_ADDRESS}</code>\n` +
       `Statut: <b>${order.status}</b>`;
 
-    // IMPORTANT: callback_data contient AUSSI l'id client
+    // ⚠️ IMPORTANT : on garde les boutons dans le message admin
     if (BOT_TOKEN && ADMIN_CHAT_ID) {
       await tgSend(ADMIN_CHAT_ID, adminText, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: "✅ Confirmer payé", callback_data: `pay:${orderCode}:${order.user.id}` }],
-            [{ text: "❌ Annuler", callback_data: `cancel:${orderCode}:${order.user.id}` }],
-            [{ text: "📦 Expédié", callback_data: `ship:${orderCode}:${order.user.id}` }],
+            [{ text: "✅ Confirmer payé", callback_data: `ok:${orderCode}` }],
+            [{ text: "❌ Annuler", callback_data: `cancel:${orderCode}` }],
+            [{ text: "📦 Expédié", callback_data: `ship:${orderCode}` }],
           ],
         },
       });
     }
 
-    return res.json({ ok: true, orderCode, btcAddress: BTC_ADDRESS });
+    res.json({ ok: true, orderCode, btcAddress: BTC_ADDRESS });
   } catch (e) {
     console.error("create-order error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// 2) Client clique “J’ai payé (BTC)” → notif admin
+// 2) Client clique “J’ai payé (BTC)” => notif admin (sans changer le statut)
 app.post("/api/client-paid-btc", async (req, res) => {
   try {
     const { orderCode, user } = req.body || {};
@@ -141,14 +132,14 @@ app.post("/api/client-paid-btc", async (req, res) => {
       `Adresse BTC: <code>${BTC_ADDRESS}</code>`;
 
     if (BOT_TOKEN && ADMIN_CHAT_ID) await tgSend(ADMIN_CHAT_ID, adminText);
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error("client-paid-btc error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    res.status(500).json({ ok: false });
   }
 });
 
-// 3) Client envoie code Transcash → notif admin
+// 3) Client envoie un code Transcash => notif admin
 app.post("/api/submit-transcash", async (req, res) => {
   try {
     const { orderCode, code, user } = req.body || {};
@@ -168,46 +159,54 @@ app.post("/api/submit-transcash", async (req, res) => {
       `➡️ Code: <code>${clean}</code>`;
 
     if (BOT_TOKEN && ADMIN_CHAT_ID) await tgSend(ADMIN_CHAT_ID, adminText);
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error("submit-transcash error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    res.status(500).json({ ok: false });
   }
 });
 
-// 4) Admin met à jour le statut (appelé par le BOT admin)
-app.post("/api/admin-status", async (req, res) => {
+// ✅ ADMIN: update status (sécurisé)
+app.post("/api/admin/status", (req, res) => {
   try {
-    const { orderCode, status } = req.body || {};
-    if (!orderCode || !status) return res.status(400).json({ ok: false, error: "Missing params" });
+    const { secret, orderCode, status } = req.body || {};
+    if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+    }
+    if (!orderCode || !status) return res.status(400).json({ ok: false, error: "Missing data" });
 
     const o = orders.get(orderCode);
     if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
 
     o.status = status;
+    o.updatedAt = new Date().toISOString();
     orders.set(orderCode, o);
 
-    // notifier client
-    if (BOT_TOKEN && o.user?.id) {
-      let msg = "";
-      if (status === "PAYE") {
-        msg =
-          `✅ Paiement confirmé pour <b>${orderCode}</b>.\n\n` +
-          `📦 Merci d’envoyer votre <b>étiquette d’envoi (PDF)</b> ici.\n` +
-          `➡️ Envoyez le PDF en pièce jointe.`;
-      } else if (status === "ANNULE") {
-        msg = `❌ Votre commande <b>${orderCode}</b> a été annulée.`;
-      } else if (status === "EXPEDIE") {
-        msg = `📦 Votre commande <b>${orderCode}</b> a été expédiée.`;
-      }
+    res.json({ ok: true, order: o });
+  } catch (e) {
+    console.error("admin/status error:", e);
+    res.status(500).json({ ok: false });
+  }
+});
 
-      if (msg) await tgSend(o.user.id, msg);
+// ✅ ADMIN: historique simple (sécurisé)
+app.get("/api/admin/orders", (req, res) => {
+  try {
+    const secret = req.query.secret || "";
+    const limit = Math.min(Number(req.query.limit || 10), 50);
+
+    if (!ADMIN_SECRET || secret !== ADMIN_SECRET) {
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
     }
 
-    return res.json({ ok: true });
+    const list = Array.from(orders.values())
+      .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+      .slice(0, limit);
+
+    res.json({ ok: true, orders: list });
   } catch (e) {
-    console.error("admin-status error:", e);
-    return res.status(500).json({ ok: false, error: "Server error" });
+    console.error("admin/orders error:", e);
+    res.status(500).json({ ok: false });
   }
 });
 
