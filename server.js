@@ -1,3 +1,5 @@
+// urbanfungi-api/server.js
+require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
@@ -13,11 +15,9 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
 if (!BOT_TOKEN || !ADMIN_CHAT_ID) {
   console.error("❌ BOT_TOKEN ou ADMIN_CHAT_ID manquant (Render > Environment)");
-  // En prod, mieux vaut arrêter, sinon rien ne partira vers Telegram
-  // process.exit(1);
 }
 
-// ---- CORS (tu peux mettre l'URL de ta miniapp dans CORS_ORIGIN)
+// ---- CORS
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
@@ -29,11 +29,14 @@ app.use(
 // ---- In-memory store (⚠️ reset au restart Render)
 const orders = new Map(); // orderCode -> { user, items, totalEur, status, createdAt }
 
+// ---- Utils
 function money(n) {
   return Number(n || 0).toFixed(2);
 }
 
 async function tgSend(chatId, text, extra = {}) {
+  if (!BOT_TOKEN) return { ok: false, error: "BOT_TOKEN missing" };
+
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 
   const payload = {
@@ -41,9 +44,8 @@ async function tgSend(chatId, text, extra = {}) {
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
+    ...extra,
   };
-
-  if (extra.reply_markup) payload.reply_markup = extra.reply_markup;
 
   const res = await fetch(url, {
     method: "POST",
@@ -56,6 +58,10 @@ async function tgSend(chatId, text, extra = {}) {
   return data;
 }
 
+function buildItemsText(items) {
+  return items.map((i) => `- ${i.nom} x${i.qty} — ${money(i.prix)} €`).join("\n");
+}
+
 // ---- Health
 app.get("/", (req, res) => res.send("UrbanFungi API OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -64,24 +70,31 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.post("/api/create-order", async (req, res) => {
   try {
     const { user, items, totalEur } = req.body || {};
+
     if (!user?.id) return res.status(400).json({ ok: false, error: "Missing user.id" });
     if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ ok: false, error: "Empty items" });
 
     const orderCode = `CMD-${Math.floor(1000 + Math.random() * 9000)}`;
+
     const order = {
       orderCode,
-      user: { id: user.id, username: user.username || null },
-      items,
+      user: { id: Number(user.id), username: user.username || null },
+      items: items.map((x) => ({
+        id: x.id,
+        nom: x.nom,
+        prix: Number(x.prix),
+        qty: Number(x.qty),
+      })),
       totalEur: Number(totalEur || 0),
       status: "EN_ATTENTE",
       createdAt: new Date().toISOString(),
     };
+
     orders.set(orderCode, order);
 
-    console.log("NEW ORDER", orderCode, order.user, order.totalEur);
+    const itemsText = buildItemsText(order.items);
 
-    const itemsText = items.map(i => `- ${i.nom} x${i.qty} — ${money(i.prix)} €`).join("\n");
     const adminText =
       `🧾 <b>NOUVELLE COMMANDE ${orderCode}</b>\n` +
       `Client: @${order.user.username || "inconnu"} (id ${order.user.id})\n\n` +
@@ -91,19 +104,27 @@ app.post("/api/create-order", async (req, res) => {
       `Adresse BTC: <code>${BTC_ADDRESS}</code>\n` +
       `Statut: <b>${order.status}</b>`;
 
-    // Message admin
+    // IMPORTANT: callback_data contient AUSSI l'id client
     if (BOT_TOKEN && ADMIN_CHAT_ID) {
-      await tgSend(ADMIN_CHAT_ID, adminText);
+      await tgSend(ADMIN_CHAT_ID, adminText, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "✅ Confirmer payé", callback_data: `pay:${orderCode}:${order.user.id}` }],
+            [{ text: "❌ Annuler", callback_data: `cancel:${orderCode}:${order.user.id}` }],
+            [{ text: "📦 Expédié", callback_data: `ship:${orderCode}:${order.user.id}` }],
+          ],
+        },
+      });
     }
 
-    res.json({ ok: true, orderCode, btcAddress: BTC_ADDRESS });
+    return res.json({ ok: true, orderCode, btcAddress: BTC_ADDRESS });
   } catch (e) {
     console.error("create-order error:", e);
-    res.status(500).json({ ok: false, error: "Server error" });
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// 2) Client clique “J’ai payé (BTC)”
+// 2) Client clique “J’ai payé (BTC)” → notif admin
 app.post("/api/client-paid-btc", async (req, res) => {
   try {
     const { orderCode, user } = req.body || {};
@@ -120,14 +141,14 @@ app.post("/api/client-paid-btc", async (req, res) => {
       `Adresse BTC: <code>${BTC_ADDRESS}</code>`;
 
     if (BOT_TOKEN && ADMIN_CHAT_ID) await tgSend(ADMIN_CHAT_ID, adminText);
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
     console.error("client-paid-btc error:", e);
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
-// 3) Client envoie un code Transcash
+// 3) Client envoie code Transcash → notif admin
 app.post("/api/submit-transcash", async (req, res) => {
   try {
     const { orderCode, code, user } = req.body || {};
@@ -147,10 +168,46 @@ app.post("/api/submit-transcash", async (req, res) => {
       `➡️ Code: <code>${clean}</code>`;
 
     if (BOT_TOKEN && ADMIN_CHAT_ID) await tgSend(ADMIN_CHAT_ID, adminText);
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
     console.error("submit-transcash error:", e);
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// 4) Admin met à jour le statut (appelé par le BOT admin)
+app.post("/api/admin-status", async (req, res) => {
+  try {
+    const { orderCode, status } = req.body || {};
+    if (!orderCode || !status) return res.status(400).json({ ok: false, error: "Missing params" });
+
+    const o = orders.get(orderCode);
+    if (!o) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    o.status = status;
+    orders.set(orderCode, o);
+
+    // notifier client
+    if (BOT_TOKEN && o.user?.id) {
+      let msg = "";
+      if (status === "PAYE") {
+        msg =
+          `✅ Paiement confirmé pour <b>${orderCode}</b>.\n\n` +
+          `📦 Merci d’envoyer votre <b>étiquette d’envoi (PDF)</b> ici.\n` +
+          `➡️ Envoyez le PDF en pièce jointe.`;
+      } else if (status === "ANNULE") {
+        msg = `❌ Votre commande <b>${orderCode}</b> a été annulée.`;
+      } else if (status === "EXPEDIE") {
+        msg = `📦 Votre commande <b>${orderCode}</b> a été expédiée.`;
+      }
+
+      if (msg) await tgSend(o.user.id, msg);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("admin-status error:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
   }
 });
 
