@@ -35,15 +35,20 @@ function money(n) {
 
 async function tgSend(chatId, text, extra = {}) {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  };
+
+  if (extra.reply_markup) payload.reply_markup = extra.reply_markup;
+
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      ...extra,
-    }),
+    body: JSON.stringify(payload),
   });
 
   const data = await res.json().catch(() => ({}));
